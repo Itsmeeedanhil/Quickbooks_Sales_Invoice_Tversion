@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Web.Script.Serialization;
+using System.Xml.Linq;
 using QBFC16Lib;
 
 namespace QbsiBridge
@@ -166,14 +168,29 @@ namespace QbsiBridge
                 else if (action == "query_invoice")
                 {
                     string appName = client == "IVP" ? "Quickbooks Collection Receipt v3" : "QBSI";
-                    resp.invoices = GetInvoicesByRefNumber(refNumber, appName, client == "IVP");
+                    try
+                    {
+                        resp.invoices = GetInvoicesByRefNumber(refNumber, appName, client == "IVP");
+                    }
+                    catch (COMException comEx) when ((uint)comEx.ErrorCode == 0x80040154)
+                    {
+                        // QBFC16 not installed on client PC — fallback to QuickBooks built-in QBXMLRP2
+                        resp.invoices = GetInvoicesViaQbXmlRp2(refNumber, appName);
+                    }
                 }
                 else if (action == "query_invoice_or_so")
                 {
-                    resp.invoices = GetInvoicesByRefNumber(refNumber, "QBSI", false);
-                    if (resp.invoices.Count == 0)
+                    try
                     {
-                        resp.invoices = GetSalesOrdersByRefNumber(refNumber, "QBSI");
+                        resp.invoices = GetInvoicesByRefNumber(refNumber, "QBSI", false);
+                        if (resp.invoices.Count == 0)
+                        {
+                            resp.invoices = GetSalesOrdersByRefNumber(refNumber, "QBSI");
+                        }
+                    }
+                    catch (COMException comEx) when ((uint)comEx.ErrorCode == 0x80040154)
+                    {
+                        resp.invoices = GetInvoicesViaQbXmlRp2(refNumber, "QBSI");
                     }
                 }
                 else if (action == "query_transfer")
@@ -825,6 +842,141 @@ namespace QbsiBridge
             }
             catch { }
             return customFields;
+        }
+
+        /// <summary>
+        /// Built-in QuickBooks QBXMLRP2 fallback when QBFC16 redistributable is not installed on a client PC.
+        /// QBXMLRP2 is automatically installed with every QuickBooks Desktop installation.
+        /// </summary>
+        private static List<InvoiceDataDto> GetInvoicesViaQbXmlRp2(string refNumber, string appName)
+        {
+            var invoices = new List<InvoiceDataDto>();
+            Type rpType = Type.GetTypeFromProgID("QBXMLRP2.RequestProcessor.2")
+                       ?? Type.GetTypeFromProgID("QBXMLRP2.RequestProcessor");
+            if (rpType == null)
+                throw new Exception("QuickBooks Desktop XML RequestProcessor (QBXMLRP2) is not registered on this computer.");
+
+            dynamic rp = Activator.CreateInstance(rpType);
+            string ticket = null;
+            try
+            {
+                rp.OpenConnection("", appName);
+                ticket = rp.BeginSession("", 2); // 2 = qbFileOpenDoNotCare
+
+                string escapedRef = new XText(refNumber).ToString();
+                string qbxml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+                               "<?qbxml version=\"13.0\"?>" +
+                               "<QBXML><QBXMLMsgsRq onError=\"stopOnError\">" +
+                               "<InvoiceQueryRq>" +
+                               "<RefNumberFilter><MatchCriterion>StartsWith</MatchCriterion><RefNumber>" + escapedRef + "</RefNumber></RefNumberFilter>" +
+                               "<IncludeLineItems>true</IncludeLineItems>" +
+                               "<IncludeLinkedTxns>true</IncludeLinkedTxns>" +
+                               "<OwnerID>0</OwnerID>" +
+                               "</InvoiceQueryRq>" +
+                               "</QBXMLMsgsRq></QBXML>";
+
+                string responseXml = rp.ProcessRequest(ticket, qbxml);
+                XDocument doc = XDocument.Parse(responseXml);
+
+                foreach (var invRet in doc.Descendants("InvoiceRet"))
+                {
+                    string foundRef = (string)invRet.Element("RefNumber") ?? "";
+                    if (!string.Equals(foundRef, refNumber, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var customFields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var ext in invRet.Elements("DataExtRet"))
+                    {
+                        string n = (string)ext.Element("DataExtName") ?? "";
+                        string v = (string)ext.Element("DataExtValue") ?? "";
+                        if (!string.IsNullOrEmpty(n)) customFields[n] = v;
+                    }
+
+                    double subtotal = (double?)invRet.Element("Subtotal") ?? 0.0;
+                    double salesTaxTotal = (double?)invRet.Element("SalesTaxTotal") ?? 0.0;
+                    double balanceRemaining = (double?)invRet.Element("BalanceRemaining") ?? 0.0;
+                    double totalAmount = subtotal + salesTaxTotal;
+                    string taxesName = (string)invRet.Element("ItemSalesTaxRef")?.Element("FullName") ?? "";
+                    string salesRep = (string)invRet.Element("SalesRepRef")?.Element("FullName") ?? "";
+
+                    XElement billBlock = invRet.Element("BillAddressBlock") ?? invRet.Element("BillAddress");
+                    XElement shipBlock = invRet.Element("ShipAddressBlock") ?? invRet.Element("ShipAddress");
+
+                    DateTime txnDt, dueDt;
+                    string txnDateStr = DateTime.TryParse((string)invRet.Element("TxnDate"), out txnDt) ? txnDt.ToString("MM/dd/yyyy") : "";
+                    string dueDateStr = DateTime.TryParse((string)invRet.Element("DueDate"), out dueDt) ? dueDt.ToString("MM/dd/yyyy") : "";
+
+                    var dto = new InvoiceDataDto
+                    {
+                        refNumber = foundRef,
+                        customerName = (string)invRet.Element("CustomerRef")?.Element("FullName") ?? "",
+                        poNumber = (string)invRet.Element("PONumber") ?? "",
+                        terms = (string)invRet.Element("TermsRef")?.Element("FullName") ?? "",
+                        salesrep = salesRep,
+                        taxesName = taxesName,
+                        txnDate = txnDateStr,
+                        dueDate = dueDateStr,
+                        subtotal = subtotal,
+                        salesTaxTotal = salesTaxTotal,
+                        totalAmount = totalAmount,
+                        balanceRemaining = balanceRemaining > 0 ? balanceRemaining : totalAmount,
+                        billAddress1 = (string)billBlock?.Element("Addr1") ?? "",
+                        billAddress2 = (string)billBlock?.Element("Addr2") ?? "",
+                        billAddress3 = (string)billBlock?.Element("Addr3") ?? "",
+                        billAddress4 = (string)billBlock?.Element("Addr4") ?? "",
+                        billAddress5 = (string)billBlock?.Element("Addr5") ?? "",
+                        shipAddress1 = (string)shipBlock?.Element("Addr1") ?? "",
+                        shipAddress2 = (string)shipBlock?.Element("Addr2") ?? "",
+                        shipAddress3 = (string)shipBlock?.Element("Addr3") ?? "",
+                        shipAddress4 = (string)shipBlock?.Element("Addr4") ?? "",
+                        shipAddress5 = (string)shipBlock?.Element("Addr5") ?? "",
+                        tinNo = LookupCustomField(customFields, "TIN", "CustomFieldTIN", "TINNO"),
+                        pwdNo = LookupCustomField(customFields, "PWDNO", "PWD NO", "CustomFieldPWDNO"),
+                        drNo = LookupCustomField(customFields, "DRNO", "DR NO", "CustomFieldDRNO"),
+                        jobOrderNo = LookupCustomField(customFields, "JOBORDERNO", "JOB ORDER NO", "CustomFieldJOBORDERNO"),
+                        soNumber = LookupCustomField(customFields, "SONO", "SO NO", "CustomFieldSONO"),
+                        businessStyle = LookupCustomField(customFields, "BUSINESSSTYLE", "BUSINESS STYLE", "CustomFieldBUSINESSSTYLE"),
+                        storeCode = LookupCustomField(customFields, "STORECODE", "STORE CODE", "CustomFieldSTORECODE"),
+                        attention = LookupCustomField(customFields, "ATTENTION", "CustomFieldATTENTION"),
+                        customFields = customFields,
+                        lineItems = new List<InvoiceLineItemDto>()
+                    };
+
+                    foreach (var line in invRet.Elements("InvoiceLineRet"))
+                    {
+                        double lineAmt = (double?)line.Element("Amount") ?? 0.0;
+                        double lineRate = (double?)line.Element("Rate") ?? 0.0;
+                        double lineTaxAmt = (double?)line.Element("TaxAmount") ?? salesTaxTotal;
+
+                        dto.lineItems.Add(new InvoiceLineItemDto
+                        {
+                            itemName = (string)line.Element("ItemRef")?.Element("FullName") ?? "",
+                            description = (string)line.Element("Desc") ?? "",
+                            quantity = (double?)line.Element("Quantity") ?? 0.0,
+                            unitOfMeasure = (string)line.Element("UnitOfMeasure") ?? "",
+                            rate = lineRate,
+                            amount = lineAmt,
+                            totalAmount = balanceRemaining > 0 ? balanceRemaining : totalAmount,
+                            expirationDate = (string)line.Element("Other1") ?? "",
+                            skuCode = (string)line.Element("Other2") ?? "",
+                            tax = (string)line.Element("SalesTaxCodeRef")?.Element("FullName") ?? "",
+                            taxesName = taxesName,
+                            salesTaxTotal = lineTaxAmt > 0 ? lineTaxAmt : salesTaxTotal,
+                            salesrep = salesRep,
+                            serviceDate = (string)line.Element("ServiceDate") ?? ""
+                        });
+                    }
+
+                    invoices.Add(dto);
+                }
+            }
+            finally
+            {
+                if (ticket != null) { try { rp.EndSession(ticket); } catch { } }
+                try { rp.CloseConnection(); } catch { }
+            }
+
+            return invoices;
         }
     }
 }
