@@ -178,23 +178,34 @@ struct BridgeJsonOutput {
     pub transfers: Vec<TransferInventoryData>,
 }
 
-/// Resolves the runtime data directory OUTSIDE `src-tauri/` so `cargo tauri dev`'s file watcher
-/// never restarts the app when logs or database files are written.
+/// Resolves the runtime data directory OUTSIDE `src-tauri/` in development,
+/// and inside `%LOCALAPPDATA%\CustomQBSI` when installed on a client PC so
+/// database and log writes never fail due to Program Files permissions.
 fn resolve_appdata_dir() -> PathBuf {
-    if let Ok(cwd) = std::env::current_dir() {
-        // When running under `cargo tauri dev`, current_dir is `<root>/src-tauri`
-        if cwd.file_name().and_then(|n| n.to_str()) == Some("src-tauri") {
-            if let Some(parent) = cwd.parent() {
-                let dir = parent.join("appdata");
-                let _ = fs::create_dir_all(&dir);
-                return dir;
+    if cfg!(debug_assertions) {
+        if let Ok(cwd) = std::env::current_dir() {
+            if cwd.file_name().and_then(|n| n.to_str()) == Some("src-tauri") {
+                if let Some(parent) = cwd.parent() {
+                    let dir = parent.join("appdata");
+                    let _ = fs::create_dir_all(&dir);
+                    return dir;
+                }
             }
+            let dir = cwd.join("appdata");
+            let _ = fs::create_dir_all(&dir);
+            return dir;
         }
-        let dir = cwd.join("appdata");
+    }
+
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let dir = PathBuf::from(local_app_data).join("CustomQBSI");
         let _ = fs::create_dir_all(&dir);
         return dir;
     }
-    PathBuf::from("appdata")
+
+    let fallback = PathBuf::from("appdata");
+    let _ = fs::create_dir_all(&fallback);
+    fallback
 }
 
 fn log_to_file(appdata_dir: &Path, file_name: &str, message: &str) {
@@ -206,8 +217,23 @@ fn log_to_file(appdata_dir: &Path, file_name: &str, message: &str) {
     }
 }
 
-fn locate_file(appdata_dir: &Path, file_name: &str) -> Option<PathBuf> {
+fn locate_bundled_file(appdata_dir: &Path, file_name: &str) -> Option<PathBuf> {
     let mut candidates = vec![appdata_dir.join(file_name)];
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join(file_name));
+            candidates.push(exe_dir.join("resources").join(file_name));
+            candidates.push(exe_dir.join("_up_").join("appdata").join(file_name));
+            candidates.push(
+                exe_dir
+                    .join("resources")
+                    .join("_up_")
+                    .join("appdata")
+                    .join(file_name),
+            );
+        }
+    }
 
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(parent) = cwd.parent() {
@@ -216,17 +242,27 @@ fn locate_file(appdata_dir: &Path, file_name: &str) -> Option<PathBuf> {
         }
         candidates.push(cwd.join(file_name));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            candidates.push(exe_dir.join(file_name));
-        }
-    }
-    candidates.push(PathBuf::from(format!(
-        r"C:\Users\Tetsuro\Desktop\Custom-QBSI\Custom-QBSI\bin\x64\Debug\{}",
-        file_name
-    )));
 
     candidates.into_iter().find(|p| p.exists())
+}
+
+/// Ensures bundled helper files (`qbsdk_bridge.exe`, `Interop.QBFC16Lib.dll`, `CustomQBSIDatabase.accdb`)
+/// are staged into `appdata_dir` on first run after installation on a client machine.
+fn stage_bundled_files_to_appdata(appdata_dir: &Path) {
+    for file_name in [
+        "qbsdk_bridge.exe",
+        "Interop.QBFC16Lib.dll",
+        "CustomQBSIDatabase.accdb",
+    ] {
+        let target = appdata_dir.join(file_name);
+        if !target.exists() {
+            if let Some(src) = locate_bundled_file(appdata_dir, file_name) {
+                if src != target {
+                    let _ = fs::copy(&src, &target);
+                }
+            }
+        }
+    }
 }
 
 fn run_powershell(script: &str) -> Result<String, String> {
@@ -1171,9 +1207,11 @@ fn save_layout_offsets(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let appdata_dir = resolve_appdata_dir();
+    stage_bundled_files_to_appdata(&appdata_dir);
+
     let sqlite_path = appdata_dir.join("qbsi_settings.sqlite");
-    let accdb_path = locate_file(&appdata_dir, "CustomQBSIDatabase.accdb");
-    let bridge_exe_path = locate_file(&appdata_dir, "qbsdk_bridge.exe");
+    let accdb_path = locate_bundled_file(&appdata_dir, "CustomQBSIDatabase.accdb");
+    let bridge_exe_path = locate_bundled_file(&appdata_dir, "qbsdk_bridge.exe");
 
     if let Ok(conn) = Connection::open(&sqlite_path) {
         let _ = init_sqlite_schema(&conn);
