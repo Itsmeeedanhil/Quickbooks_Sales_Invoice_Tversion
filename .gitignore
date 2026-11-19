@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+dist-ssr/
+*.local
+
+# Tauri / Rust build artifacts
+src-tauri/target/
+src-tauri/gen/
+
+# Runtime logs and temporary lock/journal files
+*.log
+app_log.txt
+datasync_log.txt
+appdata/*.txt
+appdata/*.log
+appdata/*.sqlite*
+appdata/*.laccdb
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.laccdb
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
