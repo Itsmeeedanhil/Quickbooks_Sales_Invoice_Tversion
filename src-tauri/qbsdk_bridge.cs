@@ -172,10 +172,12 @@ namespace QbsiBridge
                     {
                         resp.invoices = GetInvoicesByRefNumber(refNumber, appName, client == "IVP");
                     }
-                    catch (COMException comEx) when ((uint)comEx.ErrorCode == 0x80040154)
+                    catch (COMException comEx)
                     {
-                        // QBFC16 not installed on client PC — fallback to QuickBooks built-in QBXMLRP2
-                        resp.invoices = GetInvoicesViaQbXmlRp2(refNumber, appName);
+                        if ((uint)comEx.ErrorCode == 0x80040154)
+                            resp.invoices = GetInvoicesViaQbXmlRp2(refNumber, appName);
+                        else
+                            throw;
                     }
                 }
                 else if (action == "query_invoice_or_so")
@@ -188,9 +190,12 @@ namespace QbsiBridge
                             resp.invoices = GetSalesOrdersByRefNumber(refNumber, "QBSI");
                         }
                     }
-                    catch (COMException comEx) when ((uint)comEx.ErrorCode == 0x80040154)
+                    catch (COMException comEx)
                     {
-                        resp.invoices = GetInvoicesViaQbXmlRp2(refNumber, "QBSI");
+                        if ((uint)comEx.ErrorCode == 0x80040154)
+                            resp.invoices = GetInvoicesViaQbXmlRp2(refNumber, "QBSI");
+                        else
+                            throw;
                     }
                 }
                 else if (action == "query_transfer")
@@ -844,6 +849,20 @@ namespace QbsiBridge
             return customFields;
         }
 
+        private static string GetXmlVal(XElement el, string childName)
+        {
+            if (el == null) return "";
+            XElement c = el.Element(childName);
+            return c != null ? (c.Value ?? "") : "";
+        }
+
+        private static string GetNestedXmlVal(XElement el, string parentName, string childName)
+        {
+            if (el == null) return "";
+            XElement p = el.Element(parentName);
+            return GetXmlVal(p, childName);
+        }
+
         /// <summary>
         /// Built-in QuickBooks QBXMLRP2 fallback when QBFC16 redistributable is not installed on a client PC.
         /// QBXMLRP2 is automatically installed with every QuickBooks Desktop installation.
@@ -880,15 +899,15 @@ namespace QbsiBridge
 
                 foreach (var invRet in doc.Descendants("InvoiceRet"))
                 {
-                    string foundRef = (string)invRet.Element("RefNumber") ?? "";
+                    string foundRef = GetXmlVal(invRet, "RefNumber");
                     if (!string.Equals(foundRef, refNumber, StringComparison.OrdinalIgnoreCase))
                         continue;
 
                     var customFields = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
                     foreach (var ext in invRet.Elements("DataExtRet"))
                     {
-                        string n = (string)ext.Element("DataExtName") ?? "";
-                        string v = (string)ext.Element("DataExtValue") ?? "";
+                        string n = GetXmlVal(ext, "DataExtName");
+                        string v = GetXmlVal(ext, "DataExtValue");
                         if (!string.IsNullOrEmpty(n)) customFields[n] = v;
                     }
 
@@ -896,22 +915,22 @@ namespace QbsiBridge
                     double salesTaxTotal = (double?)invRet.Element("SalesTaxTotal") ?? 0.0;
                     double balanceRemaining = (double?)invRet.Element("BalanceRemaining") ?? 0.0;
                     double totalAmount = subtotal + salesTaxTotal;
-                    string taxesName = (string)invRet.Element("ItemSalesTaxRef")?.Element("FullName") ?? "";
-                    string salesRep = (string)invRet.Element("SalesRepRef")?.Element("FullName") ?? "";
+                    string taxesName = GetNestedXmlVal(invRet, "ItemSalesTaxRef", "FullName");
+                    string salesRep = GetNestedXmlVal(invRet, "SalesRepRef", "FullName");
 
                     XElement billBlock = invRet.Element("BillAddressBlock") ?? invRet.Element("BillAddress");
                     XElement shipBlock = invRet.Element("ShipAddressBlock") ?? invRet.Element("ShipAddress");
 
                     DateTime txnDt, dueDt;
-                    string txnDateStr = DateTime.TryParse((string)invRet.Element("TxnDate"), out txnDt) ? txnDt.ToString("MM/dd/yyyy") : "";
-                    string dueDateStr = DateTime.TryParse((string)invRet.Element("DueDate"), out dueDt) ? dueDt.ToString("MM/dd/yyyy") : "";
+                    string txnDateStr = DateTime.TryParse(GetXmlVal(invRet, "TxnDate"), out txnDt) ? txnDt.ToString("MM/dd/yyyy") : "";
+                    string dueDateStr = DateTime.TryParse(GetXmlVal(invRet, "DueDate"), out dueDt) ? dueDt.ToString("MM/dd/yyyy") : "";
 
                     var dto = new InvoiceDataDto
                     {
                         refNumber = foundRef,
-                        customerName = (string)invRet.Element("CustomerRef")?.Element("FullName") ?? "",
-                        poNumber = (string)invRet.Element("PONumber") ?? "",
-                        terms = (string)invRet.Element("TermsRef")?.Element("FullName") ?? "",
+                        customerName = GetNestedXmlVal(invRet, "CustomerRef", "FullName"),
+                        poNumber = GetXmlVal(invRet, "PONumber"),
+                        terms = GetNestedXmlVal(invRet, "TermsRef", "FullName"),
                         salesrep = salesRep,
                         taxesName = taxesName,
                         txnDate = txnDateStr,
@@ -920,16 +939,16 @@ namespace QbsiBridge
                         salesTaxTotal = salesTaxTotal,
                         totalAmount = totalAmount,
                         balanceRemaining = balanceRemaining > 0 ? balanceRemaining : totalAmount,
-                        billAddress1 = (string)billBlock?.Element("Addr1") ?? "",
-                        billAddress2 = (string)billBlock?.Element("Addr2") ?? "",
-                        billAddress3 = (string)billBlock?.Element("Addr3") ?? "",
-                        billAddress4 = (string)billBlock?.Element("Addr4") ?? "",
-                        billAddress5 = (string)billBlock?.Element("Addr5") ?? "",
-                        shipAddress1 = (string)shipBlock?.Element("Addr1") ?? "",
-                        shipAddress2 = (string)shipBlock?.Element("Addr2") ?? "",
-                        shipAddress3 = (string)shipBlock?.Element("Addr3") ?? "",
-                        shipAddress4 = (string)shipBlock?.Element("Addr4") ?? "",
-                        shipAddress5 = (string)shipBlock?.Element("Addr5") ?? "",
+                        billAddress1 = GetXmlVal(billBlock, "Addr1"),
+                        billAddress2 = GetXmlVal(billBlock, "Addr2"),
+                        billAddress3 = GetXmlVal(billBlock, "Addr3"),
+                        billAddress4 = GetXmlVal(billBlock, "Addr4"),
+                        billAddress5 = GetXmlVal(billBlock, "Addr5"),
+                        shipAddress1 = GetXmlVal(shipBlock, "Addr1"),
+                        shipAddress2 = GetXmlVal(shipBlock, "Addr2"),
+                        shipAddress3 = GetXmlVal(shipBlock, "Addr3"),
+                        shipAddress4 = GetXmlVal(shipBlock, "Addr4"),
+                        shipAddress5 = GetXmlVal(shipBlock, "Addr5"),
                         tinNo = LookupCustomField(customFields, "TIN", "CustomFieldTIN", "TINNO"),
                         pwdNo = LookupCustomField(customFields, "PWDNO", "PWD NO", "CustomFieldPWDNO"),
                         drNo = LookupCustomField(customFields, "DRNO", "DR NO", "CustomFieldDRNO"),
@@ -950,20 +969,20 @@ namespace QbsiBridge
 
                         dto.lineItems.Add(new InvoiceLineItemDto
                         {
-                            itemName = (string)line.Element("ItemRef")?.Element("FullName") ?? "",
-                            description = (string)line.Element("Desc") ?? "",
+                            itemName = GetNestedXmlVal(line, "ItemRef", "FullName"),
+                            description = GetXmlVal(line, "Desc"),
                             quantity = (double?)line.Element("Quantity") ?? 0.0,
-                            unitOfMeasure = (string)line.Element("UnitOfMeasure") ?? "",
+                            unitOfMeasure = GetXmlVal(line, "UnitOfMeasure"),
                             rate = lineRate,
                             amount = lineAmt,
                             totalAmount = balanceRemaining > 0 ? balanceRemaining : totalAmount,
-                            expirationDate = (string)line.Element("Other1") ?? "",
-                            skuCode = (string)line.Element("Other2") ?? "",
-                            tax = (string)line.Element("SalesTaxCodeRef")?.Element("FullName") ?? "",
+                            expirationDate = GetXmlVal(line, "Other1"),
+                            skuCode = GetXmlVal(line, "Other2"),
+                            tax = GetNestedXmlVal(line, "SalesTaxCodeRef", "FullName"),
                             taxesName = taxesName,
                             salesTaxTotal = lineTaxAmt > 0 ? lineTaxAmt : salesTaxTotal,
                             salesrep = salesRep,
-                            serviceDate = (string)line.Element("ServiceDate") ?? ""
+                            serviceDate = GetXmlVal(line, "ServiceDate")
                         });
                     }
 
