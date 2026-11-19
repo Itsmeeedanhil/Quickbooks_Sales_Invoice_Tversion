@@ -25,12 +25,12 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "resources": [
-      "qbsdk_bridge.exe",
-      "Interop.QBFC16Lib.dll",
-      "../appdata/CustomQBSIDatabase.accdb"
-    ],
+    "targets": ["msi"],
+    "publisher": "Custom QBSI Solutions",
+    "copyright": "Copyright (c) 2026 Custom QBSI Solutions. All rights reserved.",
+    "shortDescription": "QuickBooks Desktop Sales Invoice and Receipt Printing Utility",
+    "longDescription": "Desktop printing and layout utility for QuickBooks Desktop Sales Invoices, Collection Receipts, and Delivery Receipts.",
+    "category": "Business",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

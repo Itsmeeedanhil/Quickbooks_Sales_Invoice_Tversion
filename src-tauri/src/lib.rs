@@ -1,3 +1,5 @@
+mod qbxml;
+
 use chrono::Local;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -5,20 +7,11 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
-
-#[cfg(target_os = "windows")]
-use std::os::windows::process::CommandExt;
-
-#[cfg(target_os = "windows")]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 pub struct AppState {
     pub appdata_dir: PathBuf,
     pub sqlite_path: PathBuf,
-    pub accdb_path: Option<PathBuf>,
-    pub bridge_exe_path: Option<PathBuf>,
     pub db_mutex: Mutex<()>,
 }
 
@@ -170,14 +163,6 @@ pub struct AppDeploymentConfig {
     pub default_client: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct BridgeJsonOutput {
-    pub ok: bool,
-    pub error: String,
-    pub invoices: Vec<InvoiceData>,
-    pub transfers: Vec<TransferInventoryData>,
-}
-
 /// Resolves the runtime data directory OUTSIDE `src-tauri/` in development,
 /// and inside `%LOCALAPPDATA%\CustomQBSI` when installed on a client PC so
 /// database and log writes never fail due to Program Files permissions.
@@ -215,102 +200,6 @@ fn log_to_file(appdata_dir: &Path, file_name: &str, message: &str) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_path) {
         let _ = file.write_all(line.as_bytes());
     }
-}
-
-fn locate_bundled_file(appdata_dir: &Path, file_name: &str) -> Option<PathBuf> {
-    let mut candidates = vec![appdata_dir.join(file_name)];
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            candidates.push(exe_dir.join(file_name));
-            candidates.push(exe_dir.join("resources").join(file_name));
-            candidates.push(exe_dir.join("_up_").join("appdata").join(file_name));
-            candidates.push(
-                exe_dir
-                    .join("resources")
-                    .join("_up_")
-                    .join("appdata")
-                    .join(file_name),
-            );
-        }
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(parent) = cwd.parent() {
-            candidates.push(parent.join("appdata").join(file_name));
-            candidates.push(parent.join(file_name));
-        }
-        candidates.push(cwd.join(file_name));
-    }
-
-    candidates.into_iter().find(|p| p.exists())
-}
-
-/// Ensures bundled helper files (`qbsdk_bridge.exe`, `Interop.QBFC16Lib.dll`, `CustomQBSIDatabase.accdb`)
-/// are staged into `appdata_dir` on first run after installation on a client machine.
-fn stage_bundled_files_to_appdata(appdata_dir: &Path) {
-    for file_name in [
-        "qbsdk_bridge.exe",
-        "Interop.QBFC16Lib.dll",
-        "CustomQBSIDatabase.accdb",
-    ] {
-        let target = appdata_dir.join(file_name);
-        if !target.exists() {
-            if let Some(src) = locate_bundled_file(appdata_dir, file_name) {
-                if src != target {
-                    let _ = fs::copy(&src, &target);
-                }
-            }
-        }
-    }
-}
-
-fn run_powershell(script: &str) -> Result<String, String> {
-    let mut cmd = Command::new("powershell");
-    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    let output = cmd.output().map_err(|e| e.to_string())?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Err(format!("{} {}", stderr, stdout).trim().to_string())
-    }
-}
-
-fn run_qbsdk_bridge(
-    bridge_exe: &Path,
-    action: &str,
-    ref_number: &str,
-    client: &str,
-) -> Result<BridgeJsonOutput, String> {
-    let mut cmd = Command::new(bridge_exe);
-    cmd.args([action, ref_number, client]);
-    if let Some(parent) = bridge_exe.parent() {
-        cmd.current_dir(parent);
-    }
-    #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Failed to execute QBSDK bridge: {}", e))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if stderr.is_empty() {
-            "Empty response from QuickBooks SDK bridge.".to_string()
-        } else {
-            stderr
-        });
-    }
-
-    serde_json::from_str::<BridgeJsonOutput>(&stdout)
-        .map_err(|e| format!("Invalid JSON from QBSDK bridge: {} (Output: {})", e, stdout))
 }
 
 fn init_sqlite_schema(conn: &Connection) -> Result<(), String> {
@@ -365,7 +254,6 @@ fn init_sqlite_schema(conn: &Connection) -> Result<(), String> {
         "INSERT OR IGNORE INTO ProgrammerConfig (Key, Value) VALUES ('enabled_clients', '[\"Enclosure\",\"FP\",\"PBS\",\"NHC\",\"MET\",\"IVP\",\"MEDILIGHT\"]')",
         [],
     );
-    // Also ensure MEDILIGHT is added to existing default list if all 6 previous defaults were enabled
     let _ = conn.execute(
         "UPDATE ProgrammerConfig SET Value = '[\"Enclosure\",\"FP\",\"PBS\",\"NHC\",\"MET\",\"IVP\",\"MEDILIGHT\"]' WHERE Key = 'enabled_clients' AND Value = '[\"Enclosure\",\"FP\",\"PBS\",\"NHC\",\"MET\",\"IVP\"]'",
         [],
@@ -390,180 +278,6 @@ fn init_sqlite_schema(conn: &Connection) -> Result<(), String> {
         );
     }
 
-    Ok(())
-}
-
-fn import_settings_from_accdb(accdb_path: &Path, sqlite_path: &Path) -> Result<(), String> {
-    let accdb_str = accdb_path.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        r#"
-$ErrorActionPreference = 'Stop'
-$connStr = "Provider=Microsoft.ACE.OLEDB.12.0;Data Source='{accdb}';Persist Security Info=False;"
-$conn = New-Object System.Data.OleDb.OleDbConnection($connStr)
-$conn.Open()
-
-function Query-Table($sql) {{
-    try {{
-        $cmd = $conn.CreateCommand()
-        $cmd.CommandText = $sql
-        $adapter = New-Object System.Data.OleDb.OleDbDataAdapter($cmd)
-        $dt = New-Object System.Data.DataTable
-        $null = $adapter.Fill($dt)
-        $rows = @()
-        foreach ($r in $dt.Rows) {{
-            $obj = @{{}}
-            foreach ($c in $dt.Columns) {{
-                $val = $r[$c]
-                if ($val -is [System.DBNull]) {{ $obj[$c.ColumnName] = "" }}
-                elseif ($val -is [DateTime]) {{ $obj[$c.ColumnName] = $val.ToString("MM/dd/yyyy") }}
-                else {{ $obj[$c.ColumnName] = [string]$val }}
-            }}
-            $rows += $obj
-        }}
-        return $rows
-    }} catch {{
-        return @()
-    }}
-}}
-
-$data = @{{
-    seriesEnclosure = Query-Table "SELECT Series FROM [SeriesNumber_Enclosure]"
-    seriesFP = Query-Table "SELECT Series FROM [SeriesNumber_FP]"
-    seriesPBS = Query-Table "SELECT Series FROM [SeriesNumber_PBS]"
-    seriesIVP = Query-Table "SELECT Series FROM [SeriesNumber_IVP]"
-    sigEnclosure = Query-Table "SELECT PreparedBy, CheckedBy, ApprovedBy FROM [Signatory_Enclosure] WHERE ID = 1"
-    sigFP = Query-Table "SELECT PreparedBy, CheckedBy, ApprovedBy FROM [Signatory_FP] WHERE ID = 1"
-    sigPBS = Query-Table "SELECT PreparedBy, CheckedBy, ApprovedBy FROM [Signatory_PBS] WHERE ID = 1"
-    sigIVP = Query-Table "SELECT PreparedBy, CheckedBy, ApprovedBy FROM [Signatory_IVP] WHERE ID = 1"
-    sigMET = Query-Table "SELECT CashierName FROM [Signatory_MET] WHERE ID = 1"
-    sigNHC = Query-Table "SELECT CashierName, Address, Terms, StoreCode, PONo, TINNo FROM [Signatory_NHC] WHERE ID = 1"
-    detEnclosure = Query-Table "SELECT TOP 1 ACNO, DateIssued FROM [DetailedEnclosure] ORDER BY ID DESC"
-    detFP = Query-Table "SELECT TOP 1 ACNO, DateIssued FROM [DetailedFP] ORDER BY ID DESC"
-    detPBS = Query-Table "SELECT TOP 1 ACNO, DateIssued FROM [DetailedPBS] ORDER BY ID DESC"
-    detIVP = Query-Table "SELECT TOP 1 ACNO, DateIssued FROM [DetailedIVP] ORDER BY ID DESC"
-    historyDR = Query-Table "SELECT RefNumber, Address, Terms, StoreCode, PONumber, TIN, BusinessStyle, Note, CustomerName FROM [HistoryDRDetails]"
-}}
-$conn.Close()
-$data | ConvertTo-Json -Depth 5 -Compress
-"#,
-        accdb = accdb_str
-    );
-
-    let json_str = run_powershell(&script)?;
-    let parsed: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| e.to_string())?;
-
-    let mut conn = Connection::open(sqlite_path).map_err(|e| e.to_string())?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-
-    for (client, key) in [
-        ("Enclosure", "seriesEnclosure"),
-        ("FP", "seriesFP"),
-        ("PBS", "seriesPBS"),
-        ("IVP", "seriesIVP"),
-    ] {
-        if let Some(arr) = parsed.get(key).and_then(|v| v.as_array()) {
-            if let Some(first) = arr.first() {
-                let s_val = first
-                    .get("Series")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim();
-                let series_num = s_val.parse::<i32>().unwrap_or(1).max(1);
-                let _ = tx.execute(
-                    "INSERT OR REPLACE INTO SeriesNumber (Client, Series) VALUES (?1, ?2)",
-                    params![client, series_num],
-                );
-            }
-        }
-    }
-
-    for (client, key) in [
-        ("Enclosure", "sigEnclosure"),
-        ("FP", "sigFP"),
-        ("PBS", "sigPBS"),
-        ("IVP", "sigIVP"),
-    ] {
-        if let Some(arr) = parsed.get(key).and_then(|v| v.as_array()) {
-            if let Some(first) = arr.first() {
-                let prep = first.get("PreparedBy").and_then(|v| v.as_str()).unwrap_or("");
-                let chk = first.get("CheckedBy").and_then(|v| v.as_str()).unwrap_or("");
-                let app = first.get("ApprovedBy").and_then(|v| v.as_str()).unwrap_or("");
-                let _ = tx.execute(
-                    "UPDATE Signatory SET PreparedBy = ?1, CheckedBy = ?2, ApprovedBy = ?3 WHERE Client = ?4",
-                    params![prep, chk, app, client],
-                );
-            }
-        }
-    }
-
-    if let Some(arr) = parsed.get("sigMET").and_then(|v| v.as_array()) {
-        if let Some(first) = arr.first() {
-            let cashier = first.get("CashierName").and_then(|v| v.as_str()).unwrap_or("");
-            let _ = tx.execute(
-                "UPDATE Signatory SET CashierName = ?1 WHERE Client = 'MET'",
-                params![cashier],
-            );
-        }
-    }
-
-    if let Some(arr) = parsed.get("sigNHC").and_then(|v| v.as_array()) {
-        if let Some(first) = arr.first() {
-            let cashier = first.get("CashierName").and_then(|v| v.as_str()).unwrap_or("");
-            let addr = first.get("Address").and_then(|v| v.as_str()).unwrap_or("");
-            let terms = first.get("Terms").and_then(|v| v.as_str()).unwrap_or("");
-            let sc = first.get("StoreCode").and_then(|v| v.as_str()).unwrap_or("");
-            let po = first.get("PONo").and_then(|v| v.as_str()).unwrap_or("");
-            let tin = first.get("TINNo").and_then(|v| v.as_str()).unwrap_or("");
-            let _ = tx.execute(
-                "UPDATE Signatory SET CashierName = ?1, Address = ?2, Terms = ?3, StoreCode = ?4, PONo = ?5, TINNo = ?6 WHERE Client = 'NHC'",
-                params![cashier, addr, terms, sc, po, tin],
-            );
-        }
-    }
-
-    for (client, key) in [
-        ("Enclosure", "detEnclosure"),
-        ("FP", "detFP"),
-        ("PBS", "detPBS"),
-        ("IVP", "detIVP"),
-    ] {
-        if let Some(arr) = parsed.get(key).and_then(|v| v.as_array()) {
-            if let Some(first) = arr.first() {
-                let acno = first.get("ACNO").and_then(|v| v.as_str()).unwrap_or("");
-                let di = first.get("DateIssued").and_then(|v| v.as_str()).unwrap_or("");
-                let _ = tx.execute("DELETE FROM DetailedPermit WHERE Client = ?1", params![client]);
-                let _ = tx.execute(
-                    "INSERT INTO DetailedPermit (Client, ACNO, DateIssued) VALUES (?1, ?2, ?3)",
-                    params![client, acno, di],
-                );
-            }
-        }
-    }
-
-    if let Some(arr) = parsed.get("historyDR").and_then(|v| v.as_array()) {
-        for item in arr {
-            let ref_num = item.get("RefNumber").and_then(|v| v.as_str()).unwrap_or("");
-            if !ref_num.is_empty() {
-                let _ = tx.execute(
-                    "INSERT OR REPLACE INTO HistoryDRDetails (RefNumber, Address, Terms, StoreCode, PONumber, TIN, BusinessStyle, Note, CustomerName)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        ref_num,
-                        item.get("Address").and_then(|v| v.as_str()).unwrap_or(""),
-                        item.get("Terms").and_then(|v| v.as_str()).unwrap_or(""),
-                        item.get("StoreCode").and_then(|v| v.as_str()).unwrap_or(""),
-                        item.get("PONumber").and_then(|v| v.as_str()).unwrap_or(""),
-                        item.get("TIN").and_then(|v| v.as_str()).unwrap_or(""),
-                        item.get("BusinessStyle").and_then(|v| v.as_str()).unwrap_or(""),
-                        item.get("Note").and_then(|v| v.as_str()).unwrap_or(""),
-                        item.get("CustomerName").and_then(|v| v.as_str()).unwrap_or(""),
-                    ],
-                );
-            }
-        }
-    }
-
-    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -620,14 +334,10 @@ fn get_client_config(
         .unwrap_or_default();
 
     let db_status = DbStatus {
-        accdb_connected: state.accdb_path.is_some(),
-        accdb_path: state
-            .accdb_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "SQLite Settings Store".to_string()),
+        accdb_connected: true,
+        accdb_path: "Embedded SQLite Settings Store".to_string(),
         sqlite_path: state.sqlite_path.to_string_lossy().to_string(),
-        qbfc_available: state.bridge_exe_path.is_some(),
+        qbfc_available: true,
     };
 
     Ok(ClientConfigResponse {
@@ -655,27 +365,6 @@ fn update_series_number(
     )
     .map_err(|e| e.to_string())?;
 
-    if let Some(accdb) = &state.accdb_path {
-        if matches!(client.as_str(), "Enclosure" | "FP" | "PBS" | "IVP") {
-            let accdb_str = accdb.to_string_lossy().replace('\'', "''");
-            let script = format!(
-                r#"
-$conn = New-Object System.Data.OleDb.OleDbConnection("Provider=Microsoft.ACE.OLEDB.12.0;Data Source='{accdb}';Persist Security Info=False;")
-$conn.Open()
-$cmd = $conn.CreateCommand()
-$cmd.CommandText = "UPDATE [SeriesNumber_{client}] SET [Series] = ?"
-$null = $cmd.Parameters.AddWithValue("?", {series})
-$null = $cmd.ExecuteNonQuery()
-$conn.Close()
-"#,
-                accdb = accdb_str,
-                client = client,
-                series = series_number
-            );
-            let _ = run_powershell(&script);
-        }
-    }
-
     log_to_file(
         &state.appdata_dir,
         "app_log.txt",
@@ -698,31 +387,6 @@ fn update_ac_no_and_date(
         params![client, ac_no, date_issued],
     )
     .map_err(|e| e.to_string())?;
-
-    if let Some(accdb) = &state.accdb_path {
-        if matches!(client.as_str(), "Enclosure" | "FP" | "PBS" | "IVP") {
-            let accdb_str = accdb.to_string_lossy().replace('\'', "''");
-            let ac_escaped = ac_no.replace('\'', "''");
-            let di_escaped = date_issued.replace('\'', "''");
-            let script = format!(
-                r#"
-$conn = New-Object System.Data.OleDb.OleDbConnection("Provider=Microsoft.ACE.OLEDB.12.0;Data Source='{accdb}';Persist Security Info=False;")
-$conn.Open()
-$cmd = $conn.CreateCommand()
-$cmd.CommandText = "INSERT INTO [Detailed{client}] ([ACNO], [DateIssued]) VALUES (?, ?)"
-$null = $cmd.Parameters.AddWithValue("?", '{ac}')
-$null = $cmd.Parameters.AddWithValue("?", '{di}')
-$null = $cmd.ExecuteNonQuery()
-$conn.Close()
-"#,
-                accdb = accdb_str,
-                client = client,
-                ac = ac_escaped,
-                di = di_escaped
-            );
-            let _ = run_powershell(&script);
-        }
-    }
 
     log_to_file(
         &state.appdata_dir,
@@ -751,52 +415,6 @@ fn update_signatory(
         ],
     )
     .map_err(|e| e.to_string())?;
-
-    if let Some(accdb) = &state.accdb_path {
-        let accdb_str = accdb.to_string_lossy().replace('\'', "''");
-        let prep = signatory.prepared_by.replace('\'', "''");
-        let chk = signatory.checked_by.replace('\'', "''");
-        let app = signatory.approved_by.replace('\'', "''");
-        let cash = signatory.cashier_name.replace('\'', "''");
-
-        let sql_part = if matches!(client.as_str(), "MET" | "NHC") {
-            format!(
-                r#"
-$cmd.CommandText = "UPDATE [Signatory_{client}] SET [CashierName] = ? WHERE ID = 1"
-$null = $cmd.Parameters.AddWithValue("?", '{cash}')
-"#,
-                client = client,
-                cash = cash
-            )
-        } else {
-            format!(
-                r#"
-$cmd.CommandText = "UPDATE [Signatory_{client}] SET [PreparedBy] = ?, [CheckedBy] = ?, [ApprovedBy] = ? WHERE ID = 1"
-$null = $cmd.Parameters.AddWithValue("?", '{prep}')
-$null = $cmd.Parameters.AddWithValue("?", '{chk}')
-$null = $cmd.Parameters.AddWithValue("?", '{app}')
-"#,
-                client = client,
-                prep = prep,
-                chk = chk,
-                app = app
-            )
-        };
-
-        let script = format!(
-            r#"
-$conn = New-Object System.Data.OleDb.OleDbConnection("Provider=Microsoft.ACE.OLEDB.12.0;Data Source='{accdb}';Persist Security Info=False;")
-$conn.Open()
-$cmd = $conn.CreateCommand()
-{sql_part}
-$null = $cmd.ExecuteNonQuery()
-$conn.Close()
-"#,
-            accdb = accdb_str,
-            sql_part = sql_part
-        );
-        let _ = run_powershell(&script);
-    }
 
     log_to_file(
         &state.appdata_dir,
@@ -832,67 +450,6 @@ fn save_history_dr(
         ],
     )
     .map_err(|e| e.to_string())?;
-
-    if let Some(accdb) = &state.accdb_path {
-        let accdb_str = accdb.to_string_lossy().replace('\'', "''");
-        let r = details.ref_number.trim().replace('\'', "''");
-        let addr = details.address.replace('\'', "''");
-        let terms = details.terms.replace('\'', "''");
-        let sc = details.store_code.replace('\'', "''");
-        let po = details.po_number.replace('\'', "''");
-        let tin = details.tin.replace('\'', "''");
-        let bs = details.business_style.replace('\'', "''");
-        let note = details.note.replace('\'', "''");
-        let cname = details.customer_name.replace('\'', "''");
-
-        let script = format!(
-            r#"
-$conn = New-Object System.Data.OleDb.OleDbConnection("Provider=Microsoft.ACE.OLEDB.12.0;Data Source='{accdb}';Persist Security Info=False;")
-$conn.Open()
-$check = $conn.CreateCommand()
-$check.CommandText = "SELECT COUNT(*) FROM [HistoryDRDetails] WHERE [RefNumber] = ?"
-$null = $check.Parameters.AddWithValue("?", '{r}')
-$count = [int]$check.ExecuteScalar()
-$cmd = $conn.CreateCommand()
-if ($count -gt 0) {{
-    $cmd.CommandText = "UPDATE [HistoryDRDetails] SET [Address]=?, [Terms]=?, [StoreCode]=?, [PONumber]=?, [TIN]=?, [BusinessStyle]=?, [Note]=?, [CustomerName]=? WHERE [RefNumber]=?"
-    $null = $cmd.Parameters.AddWithValue("?", '{addr}')
-    $null = $cmd.Parameters.AddWithValue("?", '{terms}')
-    $null = $cmd.Parameters.AddWithValue("?", '{sc}')
-    $null = $cmd.Parameters.AddWithValue("?", '{po}')
-    $null = $cmd.Parameters.AddWithValue("?", '{tin}')
-    $null = $cmd.Parameters.AddWithValue("?", '{bs}')
-    $null = $cmd.Parameters.AddWithValue("?", '{note}')
-    $null = $cmd.Parameters.AddWithValue("?", '{cname}')
-    $null = $cmd.Parameters.AddWithValue("?", '{r}')
-}} else {{
-    $cmd.CommandText = "INSERT INTO [HistoryDRDetails] ([RefNumber], [Address], [Terms], [StoreCode], [PONumber], [TIN], [BusinessStyle], [Note], [CustomerName]) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    $null = $cmd.Parameters.AddWithValue("?", '{r}')
-    $null = $cmd.Parameters.AddWithValue("?", '{addr}')
-    $null = $cmd.Parameters.AddWithValue("?", '{terms}')
-    $null = $cmd.Parameters.AddWithValue("?", '{sc}')
-    $null = $cmd.Parameters.AddWithValue("?", '{po}')
-    $null = $cmd.Parameters.AddWithValue("?", '{tin}')
-    $null = $cmd.Parameters.AddWithValue("?", '{bs}')
-    $null = $cmd.Parameters.AddWithValue("?", '{note}')
-    $null = $cmd.Parameters.AddWithValue("?", '{cname}')
-}}
-$null = $cmd.ExecuteNonQuery()
-$conn.Close()
-"#,
-            accdb = accdb_str,
-            r = r,
-            addr = addr,
-            terms = terms,
-            sc = sc,
-            po = po,
-            tin = tin,
-            bs = bs,
-            note = note,
-            cname = cname
-        );
-        let _ = run_powershell(&script);
-    }
 
     log_to_file(
         &state.appdata_dir,
@@ -938,10 +495,6 @@ async fn search_document(
 
     let appdata_dir = state.appdata_dir.clone();
     let sqlite_path = state.sqlite_path.clone();
-    let bridge_exe = state
-        .bridge_exe_path
-        .clone()
-        .ok_or_else(|| "qbsdk_bridge.exe not found in application folder.".to_string())?;
 
     let history_dr = {
         let _guard = state.db_mutex.lock().map_err(|e| e.to_string())?;
@@ -959,28 +512,46 @@ async fn search_document(
     );
 
     tauri::async_runtime::spawn_blocking(move || {
-        let action = if client == "NHC" && form_type == "Delivery Receipt" {
-            "query_transfer"
-        } else if client == "MET" {
-            "query_invoice_or_so"
-        } else {
-            "query_invoice"
-        };
+        let is_transfer_query = client == "NHC" && form_type == "Delivery Receipt";
 
-        let qb_res = run_qbsdk_bridge(&bridge_exe, action, &ref_trimmed, &client)?;
-        if !qb_res.ok {
-            log_to_file(
-                &appdata_dir,
-                "datasync_log.txt",
-                &format!("QBSDK Error for RefNumber {}: {}", ref_trimmed, qb_res.error),
-            );
-            return Err(format!("QuickBooks SDK Error: {}", qb_res.error));
+        let mut invoices: Vec<InvoiceData> = Vec::new();
+        let mut transfers: Vec<TransferInventoryData> = Vec::new();
+
+        if is_transfer_query {
+            transfers = qbxml::query_transfers_from_qb(&ref_trimmed).map_err(|err| {
+                log_to_file(
+                    &appdata_dir,
+                    "datasync_log.txt",
+                    &format!("QBSDK Error for RefNumber {}: {}", ref_trimmed, err),
+                );
+                format!("QuickBooks SDK Error: {}", err)
+            })?;
+        } else {
+            invoices = qbxml::query_invoices_from_qb(&ref_trimmed, &client).map_err(|err| {
+                log_to_file(
+                    &appdata_dir,
+                    "datasync_log.txt",
+                    &format!("QBSDK Error for RefNumber {}: {}", ref_trimmed, err),
+                );
+                format!("QuickBooks SDK Error: {}", err)
+            })?;
+
+            if invoices.is_empty() && client == "MET" {
+                invoices = qbxml::query_sales_orders_from_qb(&ref_trimmed).map_err(|err| {
+                    log_to_file(
+                        &appdata_dir,
+                        "datasync_log.txt",
+                        &format!("QBSDK SO Error for RefNumber {}: {}", ref_trimmed, err),
+                    );
+                    format!("QuickBooks SDK Error: {}", err)
+                })?;
+            }
         }
 
-        let found = if action == "query_transfer" {
-            !qb_res.transfers.is_empty()
+        let found = if is_transfer_query {
+            !transfers.is_empty()
         } else {
-            !qb_res.invoices.is_empty()
+            !invoices.is_empty()
         };
 
         let message = if found {
@@ -1000,8 +571,8 @@ async fn search_document(
         Ok(DocumentSearchResult {
             found,
             source: "QuickBooks Desktop Live (QBSDK)".to_string(),
-            invoices: qb_res.invoices,
-            transfers: qb_res.transfers,
+            invoices,
+            transfers,
             history_dr,
             message,
         })
@@ -1011,17 +582,10 @@ async fn search_document(
 }
 
 #[tauri::command]
-async fn reset_qb_permission(state: tauri::State<'_, AppState>) -> Result<String, String> {
-    let bridge_exe = state
-        .bridge_exe_path
-        .clone()
-        .ok_or_else(|| "qbsdk_bridge.exe not found.".to_string())?;
-
+async fn reset_qb_permission() -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let qb_res = run_qbsdk_bridge(&bridge_exe, "reauthorize", "", "IVP")?;
-        if !qb_res.ok {
-            return Err(format!("Reauthorization Error: {}", qb_res.error));
-        }
+        qbxml::reauthorize_quickbooks()
+            .map_err(|e| format!("Reauthorization Error: {}", e))?;
         Ok("If no popup appeared, remove the app manually in QuickBooks → Preferences → Integrated Applications.".to_string())
     })
     .await
@@ -1207,24 +771,15 @@ fn save_layout_offsets(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let appdata_dir = resolve_appdata_dir();
-    stage_bundled_files_to_appdata(&appdata_dir);
-
     let sqlite_path = appdata_dir.join("qbsi_settings.sqlite");
-    let accdb_path = locate_bundled_file(&appdata_dir, "CustomQBSIDatabase.accdb");
-    let bridge_exe_path = locate_bundled_file(&appdata_dir, "qbsdk_bridge.exe");
 
     if let Ok(conn) = Connection::open(&sqlite_path) {
         let _ = init_sqlite_schema(&conn);
-    }
-    if let Some(ref accdb) = accdb_path {
-        let _ = import_settings_from_accdb(accdb, &sqlite_path);
     }
 
     let app_state = AppState {
         appdata_dir,
         sqlite_path,
-        accdb_path,
-        bridge_exe_path,
         db_mutex: Mutex::new(()),
     };
 
